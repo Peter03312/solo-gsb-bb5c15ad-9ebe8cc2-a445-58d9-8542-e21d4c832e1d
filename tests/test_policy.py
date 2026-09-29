@@ -20,6 +20,7 @@ from app.policy import (
     audit_rules,
     compare,
     evaluate,
+    locate_free_addresses,
     minimize_policy,
     nat64_codec,
     normalize,
@@ -1441,6 +1442,250 @@ def test_allocate_matches_brute_force_ipv6(seed):
         for i in range(rng.randint(0, 3))
     ]
     _assert_allocate_matches_brute_force(scope, occupied, requests)
+
+
+# ---------------------------------------------------------------------------
+# free-addresses: 0-based ordinal lookup in scope minus occupied union.
+# ---------------------------------------------------------------------------
+
+
+def test_free_addresses_plain_ordinal_walk_ipv4():
+    result = locate_free_addresses("192.0.2.0/29", [], [0, 1, 7])
+    assert result == {
+        "free_total": "8",
+        "addresses": ["192.0.2.0", "192.0.2.1", "192.0.2.7"],
+    }
+
+
+def test_free_addresses_all_address_bits_count_including_network_broadcast():
+    # No /31-style exception: both network and broadcast addresses are free.
+    result = locate_free_addresses("192.0.2.0/30", [], [0, 3])
+    assert result["free_total"] == "4"
+    assert result["addresses"] == ["192.0.2.0", "192.0.2.3"]
+
+
+def test_free_addresses_union_before_clip_overlapping_and_out_of_scope():
+    # 192.0.2.3/32 is a duplicate already inside the /31; the disjoint
+    # 203.0.113.64/26 reaches beyond the scope and is clipped away. Free are
+    # .0 .1 .4 .5 .6 .7.
+    result = locate_free_addresses(
+        "192.0.2.0/29",
+        ["192.0.2.2/31", "192.0.2.3/32", "203.0.113.64/26"],
+        [0, 1, 2, 5],
+    )
+    assert result == {
+        "free_total": "6",
+        "addresses": ["192.0.2.0", "192.0.2.1", "192.0.2.4", "192.0.2.7"],
+    }
+
+
+def test_free_addresses_occupied_supernet_covers_scope():
+    # A broad occupied CIDR containing the whole scope frees nothing.
+    assert locate_free_addresses(
+        "10.0.0.0/24", ["0.0.0.0/0", "10.0.0.5/32"], []
+    ) == {"free_total": "0", "addresses": []}
+
+
+def test_free_addresses_empty_query_still_returns_total():
+    assert locate_free_addresses(
+        "10.0.0.0/24", ["10.0.0.0/30", "10.0.0.128/25"], []
+    ) == {"free_total": "124", "addresses": []}
+
+
+def test_free_addresses_keeps_input_order_duplicates_and_repeats():
+    # Free: .0 .1 .2 .3 .5 .6 .7 (ordinal 4 lands on .5 because .4 is busy).
+    result = locate_free_addresses(
+        "10.0.0.0/29", ["10.0.0.4/32"], [3, 0, 4, 6, 6]
+    )
+    assert result["free_total"] == "7"
+    assert result["addresses"] == [
+        "10.0.0.3", "10.0.0.0", "10.0.0.5", "10.0.0.7", "10.0.0.7",
+    ]
+
+
+def test_free_addresses_host_prefix_scope():
+    assert locate_free_addresses("10.0.0.1", [], [0]) == {
+        "free_total": "1",
+        "addresses": ["10.0.0.1"],
+    }
+
+
+def test_free_addresses_ipv6_small_scope():
+    result = locate_free_addresses(
+        "2001:db8::/126",
+        ["2001:db8::1/128"],
+        [0, 1, 2],
+    )
+    assert result == {
+        "free_total": "3",
+        "addresses": ["2001:db8::", "2001:db8::2", "2001:db8::3"],
+    }
+
+
+def test_free_addresses_ipv6_slash0_total_and_extremes():
+    result = locate_free_addresses("::/0", [], [0, 2 ** 128 - 1])
+    assert result["free_total"] == str(2 ** 128)
+    assert result["addresses"] == [
+        "::",
+        "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+    ]
+
+
+def test_free_addresses_ipv6_slash0_with_occupied_half():
+    total = 2 ** 127
+    result = locate_free_addresses(
+        "::/0", ["::/1"], [0, 1, total - 2, total - 1]
+    )
+    assert result["free_total"] == str(total)
+    assert result["addresses"] == [
+        "8000::",
+        "8000::1",
+        "ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe",
+        "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+    ]
+
+
+def test_free_addresses_decimal_string_indices_accepted():
+    # Strings are the only portable way to carry ordinals past JSON's
+    # safe-integer range; both spellings are equivalent.
+    result_int = locate_free_addresses("10.0.0.0/30", [], [2])
+    result_str = locate_free_addresses("10.0.0.0/30", [], ["2"])
+    assert result_str == result_int == {
+        "free_total": "4",
+        "addresses": ["10.0.0.2"],
+    }
+
+
+def test_free_addresses_index_equal_to_total_rejected():
+    with pytest.raises(ValueError, match="out of range"):
+        locate_free_addresses("10.0.0.0/30", ["10.0.0.0/32"], [3])
+
+
+def test_free_addresses_any_index_rejected_when_no_free_space():
+    with pytest.raises(ValueError, match="0 free addresses"):
+        locate_free_addresses("10.0.0.0/30", ["10.0.0.0/30"], [0])
+
+
+@pytest.mark.parametrize("bad", [-1, "-1", " 1", "1 ", "", "abc", "0x1", "1.0", True, False, None, 1.5, object()])
+def test_free_addresses_malformed_indices_rejected(bad):
+    with pytest.raises(ValueError):
+        locate_free_addresses("10.0.0.0/24", [], [bad])
+
+
+def test_free_addresses_wrong_family_occupied_rejected():
+    with pytest.raises(ValueError, match="address family"):
+        locate_free_addresses("10.0.0.0/24", ["2001:db8::/32"], [])
+    with pytest.raises(ValueError, match="address family"):
+        locate_free_addresses("::/0", ["0.0.0.0/0"], [])
+
+
+@pytest.mark.parametrize("bad_scope", ["10.0.0.1/24", "bogus", "10.0.0.0/33"])
+def test_free_addresses_invalid_scope_rejected(bad_scope):
+    with pytest.raises(ValueError):
+        locate_free_addresses(bad_scope, [], [])
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_free_addresses_matches_brute_force_ipv4(seed):
+    rng = random.Random(6100 + seed)
+    prefixlen = rng.randint(26, 30)
+    base = rng.randrange(2 ** 32) & ~((1 << (32 - prefixlen)) - 1)
+    scope = ipaddress.IPv4Network((base, prefixlen))
+
+    occupied = set()
+    for _ in range(rng.randint(0, 5)):
+        p = rng.randint(prefixlen, 32)
+        host = rng.randrange(2 ** (32 - p))
+        network = ipaddress.IPv4Network(
+            (rng.randrange(2 ** 32) & ~((1 << (32 - p)) - 1), p)
+        )
+        # Strict networks only; keep both in-scope and disjoint entries.
+        occupied.add(network)
+
+    # Brute-force free set over the bounded scope.
+    free_nums = sorted(
+        set(range(int(scope.network_address),
+                  int(scope.broadcast_address) + 1))
+        - {
+            n
+            for net in occupied
+            for n in range(
+                max(int(net.network_address), int(scope.network_address)),
+                min(int(net.broadcast_address),
+                    int(scope.broadcast_address)) + 1,
+            )
+        }
+    )
+
+    queried = [rng.randrange(0, len(free_nums) + 8) for _ in range(rng.randint(0, 6))]
+    if any(i >= len(free_nums) for i in queried):
+        with pytest.raises(ValueError, match="out of range"):
+            locate_free_addresses(str(scope), [str(n) for n in occupied], queried)
+        return
+
+    result = locate_free_addresses(
+        str(scope), [str(n) for n in occupied], queried
+    )
+    assert result["free_total"] == str(len(free_nums))
+    assert result["addresses"] == [
+        str(ipaddress.IPv4Address(free_nums[i])) for i in queried
+    ]
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_free_addresses_matches_brute_force_ipv6(seed):
+    rng = random.Random(6200 + seed)
+    prefixlen = rng.randint(122, 126)
+    scope_base = int(ipaddress.IPv6Address("2001:db8::"))
+    scope = ipaddress.IPv6Network((scope_base, prefixlen))
+
+    occupied = set()
+    for _ in range(rng.randint(0, 5)):
+        p = rng.randint(prefixlen, 128)
+        network = ipaddress.IPv6Network(
+            (rng.getrandbits(128) & ~((1 << (128 - p)) - 1), p)
+        )
+        occupied.add(network)
+
+    free_nums = sorted(
+        set(range(int(scope.network_address),
+                  int(scope.broadcast_address) + 1))
+        - {
+            n
+            for net in occupied
+            for n in range(
+                max(int(net.network_address), int(scope.network_address)),
+                min(int(net.broadcast_address),
+                    int(scope.broadcast_address)) + 1,
+            )
+        }
+    )
+
+    queried = [rng.randrange(0, len(free_nums) + 8) for _ in range(rng.randint(0, 6))]
+    if any(i >= len(free_nums) for i in queried):
+        with pytest.raises(ValueError, match="out of range"):
+            locate_free_addresses(str(scope), [str(n) for n in occupied], queried)
+        return
+
+    result = locate_free_addresses(
+        str(scope), [str(n) for n in occupied], queried
+    )
+    assert result["free_total"] == str(len(free_nums))
+    assert result["addresses"] == [
+        str(ipaddress.IPv6Address(free_nums[i])) for i in queried
+    ]
+
+
+def test_free_addresses_does_not_enumerate_slash0_slash128():
+    # Functional proxy for "no per-address enumeration": the exact-index
+    # result equals the value computed arithmetically, and the call returns
+    # immediately where enumeration could never finish.
+    result = locate_free_addresses(
+        "::/0",
+        ["8000::/1"],
+        [2 ** 127 - 1, 0],
+    )
+    assert result["addresses"] == ["7fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "::"]
 
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 """FastAPI application exposing POST /normalize, /evaluate, /compare,
-/audit-rules, /minimize-policy, /allocate, /anonymize,
+/audit-rules, /minimize-policy, /allocate, /free-addresses, /anonymize,
 /reverse-delegations, /roa-coverage, /as-relationship-repair and
 /nat64-codec."""
 
@@ -14,6 +14,7 @@ from app.policy import (
     audit_rules,
     compare,
     evaluate,
+    locate_free_addresses,
     minimize_policy,
     nat64_codec,
     normalize,
@@ -33,6 +34,8 @@ from app.schemas import (
     CompareRequest,
     CompareResponse,
     EvaluateRequest,
+    FreeAddressesRequest,
+    FreeAddressesResponse,
     MinimizePolicyRequest,
     MinimizePolicyResponse,
     Nat64CodecRequest,
@@ -56,7 +59,9 @@ app = FastAPI(
         "one scope; minimize an allow/deny list to the smallest subset "
         "equivalent inside one scope; allocate non-overlapping subnets "
         "for a list of requests inside one scope, avoiding already-occupied "
-        "CIDRs; prefix-preservingly anonymize bare IPv4/IPv6 addresses "
+        "CIDRs; locate free addresses inside one scope minus the union of "
+        "occupied CIDRs by 0-based ascending ordinal; prefix-preservingly "
+        "anonymize bare IPv4/IPv6 addresses "
         "and strict CIDRs with an HMAC-SHA256 key for safe list sharing; "
         "and plan reverse-DNS delegations for the IPv4 networks of one /24 "
         "(direct in-addr.arpa NS for a /24, RFC 2317 range-label subzones "
@@ -69,7 +74,7 @@ app = FastAPI(
         "addresses in/from mapped IPv6 addresses per the RFC 6052 "
         "Network-Specific IPv4/IPv6 translation layout."
     ),
-    version="1.10.0",
+    version="1.11.0",
 )
 
 
@@ -536,6 +541,118 @@ def allocate_subnets(request: AllocateRequest) -> dict:
             ),
         )
     return result
+
+
+@app.post(
+    "/free-addresses",
+    response_model=FreeAddressesResponse,
+    tags=["policy"],
+    summary="Locate free addresses in a scope by 0-based ascending ordinal",
+    openapi_extra={
+        # See /evaluate: named body examples survive only via openapi_extra
+        # for model-typed parameters.
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "overlapping_and_out_of_scope_occupied": {
+                            "summary": (
+                                "Overlapping occupied CIDRs union first; the "
+                                "outside-scope /26 is clipped away"
+                            ),
+                            "value": {
+                                "scope": "192.0.2.0/29",
+                                "occupied": [
+                                    "192.0.2.2/31",
+                                    "192.0.2.3/32",
+                                    "203.0.113.64/26",
+                                ],
+                                "indices": [0, 1, 2, 0],
+                            },
+                        },
+                        "ipv6_huge_ordinal_as_string": {
+                            "summary": (
+                                "IPv6 ::/0 with one ::/1 occupied; ordinals "
+                                "past JSON's safe-integer range use strings"
+                            ),
+                            "value": {
+                                "scope": "::/0",
+                                "occupied": ["::/1"],
+                                "indices": [
+                                    0,
+                                    1,
+                                    "170141183460469231731687303715884105726",
+                                ],
+                            },
+                        },
+                        "index_at_free_total_rejected": {
+                            "summary": "Ordinal equal to the free total -> HTTP 422",
+                            "value": {
+                                "scope": "10.0.0.0/30",
+                                "occupied": ["10.0.0.0/32"],
+                                "indices": [3],
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+    responses={
+        200: {
+            "description": (
+                "The free-address total plus one address per requested "
+                "ordinal, in input order."
+            ),
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "overlapping_and_out_of_scope_occupied": {
+                            "summary": "Free addresses are .0 .1 .4..7; repeats allowed",
+                            "value": {
+                                "free_total": "6",
+                                "addresses": [
+                                    "192.0.2.0",
+                                    "192.0.2.1",
+                                    "192.0.2.4",
+                                    "192.0.2.0",
+                                ],
+                            },
+                        },
+                        "ipv6_huge_ordinal_as_string": {
+                            "summary": "Upper half of the IPv6 space, string ordinals",
+                            "value": {
+                                "free_total": "170141183460469231731687303715884105728",
+                                "addresses": [
+                                    "8000::",
+                                    "8000::1",
+                                    "ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe",
+                                ],
+                            },
+                        },                    },
+                },
+            },
+        },
+        422: {
+            "description": (
+                "Invalid scope/occupied CIDR, an occupied entry whose address "
+                "family differs from the scope, or an ordinal that is "
+                "negative/malformed or at or past the free total; the whole "
+                "batch is rejected."
+            ),
+        },
+    },
+)
+def locate_free(request: FreeAddressesRequest) -> dict:
+    try:
+        return locate_free_addresses(
+            request.scope, request.occupied, request.indices
+        )
+    except ValueError as exc:
+        # Cross-field failures (wrong family, ordinal >= free total) are only
+        # decidable after parsing the scope; surface them as 422 like the
+        # per-field schema validators, rejecting the whole batch.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.post(

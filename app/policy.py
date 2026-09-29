@@ -12,7 +12,10 @@ The module also hosts three scope-based consumers of the same primitives:
 ``audit_rules`` (per-entry impact classification inside one scope) and
 ``minimize_policy`` (minimum-cardinality equivalent rule subset inside one
 scope), plus ``allocate`` (lexicographically smallest non-overlapping subnet
-assignment inside one scope, avoiding occupied CIDRs), ``anonymize``
+assignment inside one scope, avoiding occupied CIDRs), ``locate_free_addresses``
+(0-based ordinal lookup of free addresses inside one scope minus the union of
+occupied CIDRs, by cumulative block sizes rather than address enumeration),
+``anonymize``
 (prefix-preserving keyed HMAC anonymization of bare addresses and strict
 CIDRs for safe sharing of address lists), ``reverse_delegations``
 (reverse-DNS delegation plans for the IPv4 networks of one /24: direct
@@ -35,6 +38,7 @@ import hmac
 import ipaddress
 import itertools
 import re
+from bisect import bisect_right
 from collections.abc import Iterable, Sequence
 from typing import NamedTuple, TypeAlias, Union
 
@@ -1146,6 +1150,115 @@ def allocate(
             sum(net.num_addresses for net in remaining)
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# free-addresses: locate free addresses inside one scope by 0-based ordinal.
+# The free space is scope minus the union of the occupied CIDRs (occupied
+# entries may overlap each other and reach beyond the scope; union first,
+# then clip, is exactly what the set difference provides).  Ordinal lookup
+# walks the sorted minimal free-block list with cumulative sizes, so no free
+# address is ever enumerated — even IPv6 ::/0 costs O(occupied * width).
+# ---------------------------------------------------------------------------
+
+
+def _parse_free_index(value: object) -> int:
+    """Coerce one ordinal input into a non-negative Python ``int``.
+
+    JSON numbers arrive as ``int`` (Pydantic rejects fractional values) and
+    decimal strings such as ``"340282366920938463463374607431768211455"``
+    are accepted too, so indices beyond JSON's 2^53 safe-integer range stay
+    usable for IPv6.  Booleans, signs and surrounding whitespace are
+    rejected; the caller separately rejects ordinals >= the free total.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(
+            f"index must be a non-negative decimal integer, got {value!r}"
+        )
+    if isinstance(value, str):
+        text = value
+        if not text or not text.isascii() or not text.isdigit():
+            raise ValueError(
+                f"index {value!r} is not a non-negative decimal integer"
+            )
+        return int(text)
+    if value < 0:
+        raise ValueError(f"index {value} must be non-negative")
+    return value
+
+
+def locate_free_addresses(
+    scope_raw: str,
+    occupied_raw: Sequence[str],
+    index_raw: Sequence[object],
+) -> dict:
+    """Return the free-address total and the address at each ordinal.
+
+    The free region is ``scope - union(occupied)``: occupied CIDRs may
+    overlap each other and may (partly) reach beyond the scope — the union
+    is computed first and the difference naturally clips it to the scope.
+    Every address bit counts (network and broadcast addresses included for
+    IPv4).  Ordinals are 0-based over the free addresses in ascending
+    numeric order; the result list keeps the input order (duplicates and
+    repeats are allowed).
+
+    The lookup uses cumulative block sizes plus :func:`bisect.bisect_right`
+    rather than enumerating addresses, so an IPv6 ``::/0`` scope is as
+    cheap as any other.  Inputs are assumed validated already (e.g. by the
+    Pydantic schema): the scope and every occupied CIDR parse strictly and
+    share one family.  Any ordinal at or past the free total raises
+    :class:`ValueError`, which rejects the whole batch.
+    """
+    scope = parse_network(scope_raw)
+    family = type(scope)
+
+    occupied: list[Network] = []
+    for item in occupied_raw:
+        network = parse_network(item)
+        if not isinstance(network, family):
+            raise ValueError(
+                f"occupied CIDR {network} does not match the scope address "
+                f"family ({scope})"
+            )
+        occupied.append(network)
+
+    # Minimal, sorted, non-overlapping free list; out-of-scope occupied
+    # entries are dropped by the family filter + set difference, overlaps
+    # collapse into the union before subtraction.
+    free = _normalize_family([scope], occupied, family)
+    sizes = [net.num_addresses for net in free]
+    cumulative: list[int] = []
+    running = 0
+    for size in sizes:
+        running += size
+        cumulative.append(running)
+    total = running
+
+    indices = [_parse_free_index(item) for item in index_raw]
+    for index in indices:
+        if index >= total:
+            raise ValueError(
+                f"index {index} is out of range: scope {scope} has only "
+                f"{total} free address"
+                f"{'es' if total != 1 else ''} (valid indices 0..{total - 1})"
+            )
+
+    addresses: list[str] = []
+    address_class = (
+        ipaddress.IPv4Address if family is ipaddress.IPv4Network
+        else ipaddress.IPv6Address
+    )
+    for index in indices:
+        # First free block whose cumulative end is strictly greater than the
+        # ordinal; blocks are sorted ascending and disjoint.
+        block_pos = bisect_right(cumulative, index)
+        block = free[block_pos]
+        before = cumulative[block_pos] - sizes[block_pos]
+        addresses.append(
+            str(address_class(int(block.network_address) + index - before))
+        )
+
+    return {"free_total": str(total), "addresses": addresses}
 
 
 # ---------------------------------------------------------------------------

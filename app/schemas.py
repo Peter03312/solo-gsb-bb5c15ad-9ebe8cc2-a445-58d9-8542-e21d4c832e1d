@@ -16,6 +16,7 @@ from app.policy import (
     REL_PEER,
     _MAX_PREFIXLEN,
     _nat64_decode,
+    _parse_free_index,
     _parse_nameserver,
     _parse_reverse_cidr,
     _validate_reverse_batch,
@@ -452,6 +453,72 @@ class AllocateResponse(BaseModel):
         description=(
             "Total free addresses left in the scope, as a decimal string "
             "(IPv6 remainders exceed JSON's safe integer range)."
+        ),
+    )
+
+
+class FreeAddressesRequest(BaseModel):
+    scope: str = Field(
+        description=(
+            "Single CIDR (IPv4 or IPv6) defining the address region. "
+            "Strict: host bits must be zero."
+        ),
+    )
+    occupied: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Already-occupied CIDR list. Entries may overlap each other and "
+            "reach beyond the scope (their union is clipped to it); every "
+            "entry must still parse strictly and match the scope family."
+        ),
+    )
+    indices: list[int | str] = Field(
+        default_factory=list,
+        description=(
+            "0-based ordinals of free addresses in ascending numeric order, "
+            "in response order. Each ordinal is a non-negative JSON integer "
+            "or a decimal string (strings are required past JSON's safe "
+            "integer range, e.g. large IPv6 ordinals); an ordinal at or past "
+            "the free total rejects the whole batch."
+        ),
+    )
+
+    @field_validator("scope")
+    @classmethod
+    def _validate_scope(cls, value: str) -> str:
+        parse_network(value)
+        return value
+
+    @field_validator("occupied")
+    @classmethod
+    def _validate_occupied_list(cls, values: list[str]) -> list[str]:
+        for value in values:
+            parse_network(value)
+        return values
+
+    @field_validator("indices", mode="before")
+    @classmethod
+    def _coerce_indices(cls, values: object) -> list[int]:
+        # Normalize decimal strings to ints (and reject booleans/negatives);
+        # the free-total upper bound needs the parsed scope, so it is checked
+        # by the endpoint together with family mismatch (both -> HTTP 422).
+        if not isinstance(values, list):
+            raise ValueError("indices must be a list of decimal integers")
+        return [_parse_free_index(value) for value in values]
+
+
+class FreeAddressesResponse(BaseModel):
+    free_total: str = Field(
+        description=(
+            "Total number of free addresses in the scope after subtracting "
+            "the occupied union, as a decimal string (IPv6 totals exceed "
+            "JSON's safe integer range)."
+        ),
+    )
+    addresses: list[str] = Field(
+        description=(
+            "Free address at each requested ordinal, one per index, in "
+            "input order; empty when no indices are supplied."
         ),
     )
 
