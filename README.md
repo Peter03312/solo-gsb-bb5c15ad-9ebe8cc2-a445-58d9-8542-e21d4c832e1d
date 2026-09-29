@@ -10,7 +10,8 @@
 IPv4 网段的反向 DNS 委派计划（`/reverse-delegations`）、单个 scope 内
 拟发布路由的 RPKI ROA 覆盖状态分区（`/roa-coverage`）、无向 AS 关系的
 无谷路径修复（`/as-relationship-repair`）以及 RFC 6052 网络特定前缀的
-NAT64 IPv4/IPv6 地址编解码（`/nat64-codec`）接口。
+NAT64 IPv4/IPv6 地址编解码（`/nat64-codec`）接口，以及在单个 scope 内按
+十进制序号定位空闲 IP（`/free-addresses`）接口。
 
 - deny 前缀切穿 allow 网段时，按二叉前缀树**递归对半拆分**直到边界对齐；
 - 仅当两个网段构成**完整相邻的兄弟前缀**（同一父网的左右两半）时才合并，
@@ -47,6 +48,12 @@ NAT64 IPv4/IPv6 地址编解码（`/nat64-codec`）接口。
   位跨第 64 位边界安放、**u 八位及剩余后缀全部置零**，`/96` 时 IPv4
   直接接在前缀之后；解码逐个校验前缀、u 八位与后缀均为规范值，任一非法
   地址或非规范映射**整批返回 422**；
+- `/free-addresses` 在**单个严格 CIDR scope** 内统计空闲地址总数，并把若干
+  **从 0 开始的十进制序号**映射为按地址数值升序排列的空闲地址；占用网段可
+  **互相重叠、超出 scope**（先求并集、再裁剪到 scope 后扣除），**所有地址
+  位都计数**（含网络/广播地址），全程只在网段与数量上运算、**不逐个枚举
+  地址**，可直接处理 IPv6 `::/0`；序号越界（达到空闲总数）、CIDR 非法或
+  地址族不一致**整批返回 422**，空序号列表仍返回总数；
 - 非法 CIDR（格式错误、越界前缀、主机位非零）统一返回 **HTTP 422**。
 
 ## 一条命令启动
@@ -1057,6 +1064,90 @@ curl -i -X POST http://localhost:8000/nat64-codec \
 或后缀非零（非规范映射）。**任一输入非法即整批 422，不返回部分结果**；
 空列表（`{"prefix": "2001:db8::/96"}`）合法，返回两个空数组。
 
+### `POST /free-addresses`
+
+运维场景下按序号在一个 CIDR 范围内定位空闲 IP：输入**严格 CIDR 的
+`scope`**、占用 CIDR 列表 `occupied`（允许**互相重叠、允许越出 scope**）
+以及若干**从 0 开始的十进制序号** `indices`；服务先把占用网段**求并集**、
+再**裁剪到 scope**，扣除后得到 scope 内的空闲空间。返回空闲地址**总数
+（十进制字符串）**与序号一一对应的地址，地址按**数值升序**定位；全程只做
+网段与数量运算，**不逐个枚举地址**，IPv6 `::/0` 也可正常处理。
+
+请求体：
+
+| 字段       | 类型       | 说明                                   |
+| ---------- | ---------- | -------------------------------------- |
+| `scope`    | `string`   | **必填**，单个严格 CIDR（IPv4 或 IPv6），主机位非零返回 422 |
+| `occupied` | `string[]` | 占用 CIDR 列表，可省略（默认 `[]`）。可重叠、重复、包含、越出 scope；先求并集再裁剪；但每条必须与 scope **同地址族**，否则 422 |
+| `indices`  | `string[]` | 从 0 开始的十进制序号（**字符串**），可省略（默认 `[]`）。顺序即返回顺序，可重复；不接受负号、前导零（`"01"`）或非数字 |
+
+计数口径与定位规则：
+
+- **所有地址位都计入**：空闲总数包含网络地址与广播地址，如 `/30` 即 4 个
+  地址；
+- 序号 `0` 对应空闲空间中数值最小的地址，`N-1` 对应最大地址；
+- 序号以**十进制字符串**而非 JSON 数字传递——IPv6 空闲空间最多有
+  $2^{128}$ 个地址，超出 JSON 安全整数范围（$2^{53}$）；
+- `indices` 为空时**仍计算并返回总数**，`addresses` 为空数组。
+
+示例（`occupied` 中 `10.0.0.0/31` 与重复的 `10.0.0.1/32` 先并成
+`10.0.0.0/31`，越界的 `9.255.255.252/30` 裁剪掉；空闲只剩 `.2`、`.3`，
+序号保持输入顺序且允许重复）：
+
+```bash
+curl -s -X POST http://localhost:8000/free-addresses \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "scope": "10.0.0.0/30",
+        "occupied": ["10.0.0.0/31", "10.0.0.1/32", "9.255.255.252/30"],
+        "indices": ["0", "1", "0"]
+      }'
+```
+
+响应：
+
+```json
+{
+  "free_addresses": "2",
+  "addresses": ["10.0.0.2", "10.0.0.3", "10.0.0.2"]
+}
+```
+
+空查询仍返回总数（总数为**十进制字符串**）：
+
+```bash
+curl -s -X POST http://localhost:8000/free-addresses \
+  -H 'Content-Type: application/json' \
+  -d '{"scope": "2001:db8::/120", "occupied": ["2001:db8::/126"]}'
+# {"free_addresses":"252","addresses":[]}
+```
+
+IPv6 全空间也可处理（`2001:db8::/32` 含 $2^{96}$ 个地址）：
+
+```bash
+curl -s -X POST http://localhost:8000/free-addresses \
+  -H 'Content-Type: application/json' \
+  -d '{"scope": "::/0", "occupied": ["2001:db8::/32"], "indices": ["0"]}'
+# {"free_addresses":"340282366841710300949110269838224261120",
+#  "addresses":["::"]}
+```
+
+序号达到空闲总数（即等于总数或更大）时**整批 422**，不返回部分结果：
+
+```bash
+curl -i -X POST http://localhost:8000/free-addresses \
+  -H 'Content-Type: application/json' \
+  -d '{"scope": "10.0.0.0/31", "indices": ["2"]}'
+# HTTP/1.1 422 Unprocessable Entity
+# {"detail":[{"type":"value_error","loc":["body"],
+#   "msg":"Value error, ordinal 2 is out of range for the free address space
+#          (valid range 0..1, 2 free addresses)", ...}]}
+```
+
+同样返回 **HTTP 422** 的情形：`scope`/`occupied` 中 CIDR 非法（格式错误、
+主机位非零）、`occupied` 与 scope 地址族不一致（IPv4/IPv6 混用）、序号为
+非规范十进制（负号、前导零、空串、非数字、JSON 数字类型）。
+
 ## 算法说明
 
 1. **解析校验**：`ipaddress.ip_network(value, strict=True)` 严格解析；
@@ -1220,6 +1311,26 @@ scope 的最大 CIDR 瓦片，每块直接携带**获胜条目本体**（无获�
    长度对照 RFC 6052 §2.4 样例的单测、随机 IPv4 往返对拍及 u 八位/后缀
    非零、前缀不匹配、地址族错误的拒绝用例。
 
+`/free-addresses` 建立在与 `/allocate` 相同的 scope−occupied 最小空闲
+集合之上（`app/policy.py` 中 `free_addresses` / `_free_address_blocks`
+/ `_resolve_ordinals`）：
+
+1. scope 与每条占用 CIDR 都严格解析（`strict=True`），任一与 scope 不同
+   地址族即整批报错；与 scope 不相交的同族占用条目直接忽略；
+2. 占用网段先经 `collapse_addresses` **求并集**（重叠、重复、包含自动
+   折叠），再由 `scope − 并集` 的递归前缀差集**裁剪到 scope 内**——比
+   scope 更宽的占用网段只移除其与 scope 的交集；空闲结果是排序、互不
+   重叠的最小 CIDR 列表，**所有地址位**（网络/广播地址）均计入
+   `num_addresses` 之和；
+3. 定位序号时把所有序号排序后与空闲块列表做一次**顺序归并**：维护当前块
+   起始的累计地址数 `base`，序号落在某块内时地址即
+   `块网络地址 + (序号 − base)`，**从不枚举块内地址**；重复序号解析到同一
+   地址，结果按原始输入顺序回填；
+4. 任一号 `≥ 空闲总数` 即报错（端点映射为 422，整批拒绝）；空序号列表
+   跳过定位，仅返回总数。IPv6 `::/0` 的总数为 $2^{128}$、扣除 `::/0` 后
+   为 0，均由任意精度整数直接算出。核心实现另含 IPv4/IPv6 小范围逐地址
+   暴力枚举参考实现的随机对拍测试，校验总数与每个序号的映射。
+
 ## 本地开发（不使用 Docker）
 
 需要 Python 3.11+：
@@ -1244,12 +1355,12 @@ pytest -q
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 应用：GET /health、POST /normalize、/evaluate、/compare、/audit-rules、/minimize-policy、/allocate、/anonymize、/reverse-delegations、/roa-coverage、/as-relationship-repair、/nat64-codec
-│   ├── policy.py      # 解析、递归拆分、兄弟合并、统计、最长前缀匹配、获胜者分区、规则审计、分区对比、最少规则子集搜索、子网分配搜索、前缀保持 HMAC 脱敏、反向 DNS 委派计划、ROA 覆盖状态前缀树分区、AS 关系无谷路径最少改动修复、RFC 6052 NAT64 编解码（仅 ipaddress + hmac/hashlib）
+│   ├── main.py        # FastAPI 应用：GET /health、POST /normalize、/evaluate、/compare、/audit-rules、/minimize-policy、/allocate、/anonymize、/reverse-delegations、/roa-coverage、/as-relationship-repair、/nat64-codec、/free-addresses
+│   ├── policy.py      # 解析、递归拆分、兄弟合并、统计、最长前缀匹配、获胜者分区、规则审计、分区对比、最少规则子集搜索、子网分配搜索、前缀保持 HMAC 脱敏、反向 DNS 委派计划、ROA 覆盖状态前缀树分区、AS 关系无谷路径最少改动修复、RFC 6052 NAT64 编解码、空闲地址总数统计与序号定位（仅 ipaddress + hmac/hashlib）
 │   └── schemas.py     # Pydantic 请求/响应模型与 422 校验
 ├── tests/
-│   ├── test_policy.py # 核心算法单测 + 随机对拍（含 /compare、/audit-rules 逐地址对拍、/minimize-policy 子集暴力枚举对拍、/allocate 暴力枚举对拍、/anonymize 双射/最长公共前缀保持性质与独立参考实现对拍、/reverse-delegations 名称拼装与整批校验、/roa-coverage 逐候选 RFC 6483 暴力对拍与 IPv6 超大范围不枚举性质、/as-relationship-repair 与独立 3^n 暴力参考实现对拍及 409 见证、/nat64-codec RFC 6052 六种前缀长度样例与随机往返对拍）
-│   └── test_api.py    # API 层测试（422、409、统计、空请求等，含 /reverse-delegations 排序/CNAME 覆盖/422 路径、/roa-coverage 三态分区/越界与跨族拒绝、/as-relationship-repair 共用修正/字典序决胜/422/409/OpenAPI 文档、/nat64-codec 六长度往返/顺序保持/u 八位与后缀非规范 422/OpenAPI 文档）
+│   ├── test_policy.py # 核心算法单测 + 随机对拍（含 /compare、/audit-rules 逐地址对拍、/minimize-policy 子集暴力枚举对拍、/allocate 暴力枚举对拍、/anonymize 双射/最长公共前缀保持性质与独立参考实现对拍、/reverse-delegations 名称拼装与整批校验、/roa-coverage 逐候选 RFC 6483 暴力对拍与 IPv6 超大范围不枚举性质、/as-relationship-repair 与独立 3^n 暴力参考实现对拍及 409 见证、/nat64-codec RFC 6052 六种前缀长度样例与随机往返对拍、/free-addresses IPv4/IPv6 小范围逐地址暴力枚举对拍与 ::/0 边界）
+│   └── test_api.py    # API 层测试（422、409、统计、空请求等，含 /reverse-delegations 排序/CNAME 覆盖/422 路径、/roa-coverage 三态分区/越界与跨族拒绝、/as-relationship-repair 共用修正/字典序决胜/422/409/OpenAPI 文档、/nat64-codec 六长度往返/顺序保持/u 八位与后缀非规范 422/OpenAPI 文档、/free-addresses 重叠并集/越界裁剪/序号越界/族不一致 422/OpenAPI 文档）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ipaddress
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -2336,3 +2338,284 @@ def test_nat64_codec_is_documented_in_openapi():
     assert "rfc6052_slash32_roundtrip" in response_examples
     schema = spec["components"]["schemas"]["Nat64CodecResponse"]
     assert set(schema["properties"]) == {"encoded", "decoded"}
+
+
+# ---------------------------------------------------------------------------
+# POST /free-addresses
+# ---------------------------------------------------------------------------
+
+
+def test_free_addresses_overlap_union_and_clip():
+    response = client.post(
+        "/free-addresses",
+        json={
+            "scope": "10.0.0.0/30",
+            "occupied": [
+                "10.0.0.0/31",
+                "10.0.0.1/32",
+                "9.255.255.252/30",
+            ],
+            "indices": ["0", "1", "0"],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "free_addresses": "2",
+        "addresses": ["10.0.0.2", "10.0.0.3", "10.0.0.2"],
+    }
+
+
+def test_free_addresses_indices_keep_input_order_and_may_repeat():
+    response = client.post(
+        "/free-addresses",
+        json={
+            "scope": "10.0.0.0/29",
+            "occupied": [],
+            "indices": ["5", "0", "5", "2"],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["addresses"] == [
+        "10.0.0.5", "10.0.0.0", "10.0.0.5", "10.0.0.2",
+    ]
+
+
+def test_free_addresses_empty_body_defaults():
+    response = client.post("/free-addresses", json={"scope": "10.0.0.0/24"})
+    assert response.status_code == 200
+    assert response.json() == {
+        "free_addresses": "256",
+        "addresses": [],
+    }
+
+
+def test_free_addresses_empty_indices_still_returns_total():
+    response = client.post(
+        "/free-addresses",
+        json={
+            "scope": "10.0.0.0/28",
+            "occupied": ["10.0.0.0/28"],
+            "indices": [],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {"free_addresses": "0", "addresses": []}
+
+
+def test_free_addresses_ipv4_slash_zero():
+    response = client.post(
+        "/free-addresses",
+        json={"scope": "0.0.0.0/0", "indices": [str(2**32 - 1)]},
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "free_addresses": str(2**32),
+        "addresses": ["255.255.255.255"],
+    }
+
+
+def test_free_addresses_ipv6_slash_zero_decimal_string_total():
+    response = client.post(
+        "/free-addresses", json={"scope": "::/0", "indices": []}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["free_addresses"] == str(2**128)
+    assert isinstance(body["free_addresses"], str)
+    assert body["addresses"] == []
+
+
+def test_free_addresses_ipv6_hole_boundaries():
+    response = client.post(
+        "/free-addresses",
+        json={
+            "scope": "::/0",
+            "occupied": ["2001:db8::/32"],
+            "indices": [
+                "0",
+                str(int(ipaddress.ip_address("2001:db8::")) - 1),
+                str(int(ipaddress.ip_address("2001:db8::"))),
+            ],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["addresses"] == [
+        "::",
+        "2001:db7:ffff:ffff:ffff:ffff:ffff:ffff",
+        "2001:db9::",
+    ]
+
+
+def test_free_addresses_network_and_broadcast_count():
+    response = client.post(
+        "/free-addresses",
+        json={
+            "scope": "192.0.2.0/30",
+            "occupied": [],
+            "indices": ["0", "1", "2", "3"],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "free_addresses": "4",
+        "addresses": ["192.0.2.0", "192.0.2.1", "192.0.2.2", "192.0.2.3"],
+    }
+
+
+def test_free_addresses_wider_than_scope_occupied_is_clipped():
+    response = client.post(
+        "/free-addresses",
+        json={"scope": "10.0.0.0/24", "occupied": ["10.0.0.0/8"]},
+    )
+    assert response.status_code == 200
+    assert response.json()["free_addresses"] == "0"
+
+
+def test_free_addresses_overlapping_occupied_are_unioned():
+    response = client.post(
+        "/free-addresses",
+        json={
+            "scope": "10.0.0.0/26",
+            "occupied": ["10.0.0.0/27", "10.0.0.16/28", "10.0.0.0/28"],
+            "indices": ["0"],
+        },
+    )
+    assert response.status_code == 200
+    # Union covers .0..31; free space starts at .32.
+    assert response.json()["addresses"] == ["10.0.0.32"]
+    assert response.json()["free_addresses"] == "32"
+
+
+def test_free_addresses_ordinal_equal_to_total_returns_422():
+    response = client.post(
+        "/free-addresses",
+        json={"scope": "10.0.0.0/31", "occupied": [], "indices": ["2"]},
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"][0]
+    assert detail["loc"] == ["body"]
+    assert "out of range" in detail["msg"]
+
+
+def test_free_addresses_ordinal_on_empty_space_returns_422():
+    response = client.post(
+        "/free-addresses",
+        json={
+            "scope": "::/0",
+            "occupied": ["::/0"],
+            "indices": ["0"],
+        },
+    )
+    assert response.status_code == 422
+    assert "0 free addresses" in response.json()["detail"][0]["msg"]
+
+
+def test_free_addresses_invalid_scope_returns_422():
+    response = client.post(
+        "/free-addresses",
+        json={"scope": "10.0.0.1/24", "indices": []},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "scope"]
+
+
+def test_free_addresses_missing_scope_returns_422():
+    response = client.post("/free-addresses", json={"indices": []})
+    assert response.status_code == 422
+
+
+def test_free_addresses_invalid_occupied_returns_422():
+    response = client.post(
+        "/free-addresses",
+        json={"scope": "10.0.0.0/24", "occupied": ["10.0.0.1/24"]},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "occupied"]
+
+
+def test_free_addresses_cross_family_occupied_returns_422():
+    response = client.post(
+        "/free-addresses",
+        json={
+            "scope": "10.0.0.0/24",
+            "occupied": ["2001:db8::/32"],
+            "indices": ["0"],
+        },
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body"]
+    assert "address family" in response.json()["detail"][0]["msg"]
+
+
+def test_free_addresses_ipv6_scope_with_ipv4_occupied_returns_422():
+    response = client.post(
+        "/free-addresses",
+        json={"scope": "2001:db8::/64", "occupied": ["192.0.2.0/24"]},
+    )
+    assert response.status_code == 422
+    assert "address family" in response.json()["detail"][0]["msg"]
+
+
+@pytest.mark.parametrize("ordinal", ["-1", "01", "1.0", "+3", "abc", ""])
+def test_free_addresses_malformed_ordinal_returns_422(ordinal):
+    response = client.post(
+        "/free-addresses",
+        json={"scope": "10.0.0.0/24", "indices": [ordinal]},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "indices"]
+
+
+def test_free_addresses_numeric_json_index_returns_422():
+    # Ordinals must be decimal strings: JSON numbers would lose precision for
+    # IPv6 ranges beyond 2**53.
+    response = client.post(
+        "/free-addresses",
+        json={"scope": "10.0.0.0/30", "indices": [0]},
+    )
+    assert response.status_code == 422
+
+
+def test_free_addresses_wrong_field_types_return_422():
+    for body in [
+        {"scope": 10},
+        {"scope": "10.0.0.0/24", "occupied": "10.0.0.0/25"},
+        {"scope": "10.0.0.0/24", "indices": "0"},
+        {"scope": "10.0.0.0/24", "occupied": [4]},
+        {"scope": "10.0.0.0/24", "indices": [None]},
+    ]:
+        response = client.post("/free-addresses", json=body)
+        assert response.status_code == 422, body
+
+
+def test_free_addresses_whole_batch_rejected_on_one_bad_index():
+    # A single out-of-range ordinal rejects everything; no partial response.
+    response = client.post(
+        "/free-addresses",
+        json={
+            "scope": "10.0.0.0/30",
+            "occupied": [],
+            "indices": ["0", "40"],
+        },
+    )
+    assert response.status_code == 422
+    assert "40" in response.json()["detail"][0]["msg"]
+
+
+def test_free_addresses_is_documented_in_openapi():
+    spec = client.get("/openapi.json").json()
+    assert "/free-addresses" in spec["paths"]
+    operation = spec["paths"]["/free-addresses"]["post"]
+    assert "200" in operation["responses"]
+    assert "422" in operation["responses"]
+    examples = operation["requestBody"]["content"]["application/json"][
+        "examples"
+    ]
+    assert "overlap_union_and_out_of_scope_clip" in examples
+    assert "ordinal_out_of_range" in examples
+    response_examples = operation["responses"]["200"]["content"][
+        "application/json"
+    ]["examples"]
+    assert "overlap_union_and_out_of_scope_clip" in response_examples
+    schema = spec["components"]["schemas"]["FreeAddressesResponse"]
+    assert set(schema["properties"]) == {"free_addresses", "addresses"}

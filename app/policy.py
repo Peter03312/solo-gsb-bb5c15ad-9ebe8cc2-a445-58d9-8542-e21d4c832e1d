@@ -25,7 +25,10 @@ minimal non-overlapping CIDR status partition), and ``as_relationship_repair``
 relationships so every supplied AS path becomes valley-free), plus
 ``nat64_codec`` (RFC 6052 Network-Specific IPv4/IPv6 translation: embedding
 bare IPv4 addresses after a strict translation prefix and extracting them
-back from canonical mapped IPv6 addresses).
+back from canonical mapped IPv6 addresses), and ``free_addresses`` (count
+free addresses in one scope after unioning/clipping occupied CIDRs and map
+zero-based decimal ordinals to addresses in numeric order, without
+enumerating them).
 """
 
 from __future__ import annotations
@@ -1993,3 +1996,149 @@ def nat64_codec(
         decoded.append(str(_nat64_decode(prefix, address)))
 
     return {"encoded": encoded, "decoded": decoded}
+
+
+# ---------------------------------------------------------------------------
+# free-addresses: positional lookup of free addresses inside one scope.
+# Occupied CIDRs may overlap each other and may extend beyond the scope; they
+# are unioned first (collapse_addresses), then clipped to the scope, and the
+# scope minus that union is the free space, kept as a sorted minimal CIDR
+# list.  Every address bit counts (network/broadcast addresses included) and
+# lookup walks the free blocks by numeric value, so addresses are never
+# enumerated -- IPv6 ::/0 is handled purely in block/count arithmetic.
+# ---------------------------------------------------------------------------
+
+#: An ordinal is a non-negative decimal integer: digits only, with no
+#: leading zero except "0" itself.  Ordinal strings -- not JSON numbers -- are
+#: the canonical input because a free IPv6 space can number up to 2**128
+#: addresses.
+
+
+def parse_ordinal(value: object) -> int:
+    """Parse one zero-based decimal ordinal string into an ``int``.
+
+    A negative, empty, signed, leading-zero (``"01"``) or non-numeric value
+    raises :class:`ValueError`.  Ordinal strings -- not JSON numbers -- are
+    the canonical input because a free IPv6 space can number up to 2**128
+    addresses.
+    """
+    if not isinstance(value, str):
+        raise ValueError(
+            f"ordinal must be a decimal string, got {type(value).__name__}"
+        )
+    text = value.strip()
+    if not text or not text.isascii() or not text.isdigit() or (
+        len(text) > 1 and text[0] == "0"
+    ):
+        raise ValueError(
+            f"ordinal {value!r} is not a non-negative decimal integer "
+            f"without a sign or leading zeros"
+        )
+    return int(text)
+
+
+_ADDRESS_CLASS: dict[type, type] = {
+    ipaddress.IPv4Network: ipaddress.IPv4Address,
+    ipaddress.IPv6Network: ipaddress.IPv6Address,
+}
+
+
+def _free_address_blocks(
+    scope: Network, occupied: Sequence[Network]
+) -> list[Network]:
+    """Return ``scope`` minus the union of occupied CIDRs as sorted blocks.
+
+    Occupied entries of a different family are a caller error; entries
+    disjoint from the scope contribute nothing, overlapping entries are
+    unioned by collapsing first, and entries wider than the scope are
+    clipped by the subtraction.
+    """
+    family = type(scope)
+    same_family = []
+    for network in occupied:
+        if not isinstance(network, family):
+            raise ValueError(
+                f"occupied CIDR {network} does not match the scope address "
+                f"family ({scope})"
+            )
+        if network.overlaps(scope):
+            # The pieces surviving _normalize_family are automatically
+            # clipped to the scope, so an occupied network wider than the
+            # scope removes exactly its in-scope intersection.
+            same_family.append(network)
+    return _normalize_family([scope], same_family, family)
+
+
+def _resolve_ordinals(
+    free: Sequence[Network], ordinals: Sequence[int]
+) -> list[Address]:
+    """Map each zero-based ordinal to its address in numeric free order.
+
+    The ordinals are walked together with the sorted, non-overlapping free
+    blocks, accumulating each block's size as a running base; no address is
+    enumerated.  Duplicate ordinals resolve to the same address.
+    """
+    family = type(free[0])
+    address_cls = _ADDRESS_CLASS[family]
+    order = sorted(range(len(ordinals)), key=ordinals.__getitem__)
+    resolved: dict[int, Address] = {}
+    block_iter = iter(free)
+    block = next(block_iter, None)
+    base = 0
+    for position in order:
+        ordinal = ordinals[position]
+        while block is not None and ordinal >= base + block.num_addresses:
+            base += block.num_addresses
+            block = next(block_iter, None)
+        if block is None:
+            # Caller already validated every ordinal against the total.
+            raise AssertionError("ordinal validated against total went out of range")
+        resolved[position] = address_cls(
+            int(block.network_address) + ordinal - base
+        )
+    return [resolved[position] for position in range(len(ordinals))]
+
+
+def free_addresses(
+    scope_raw: str,
+    occupied_raw: Sequence[str],
+    ordinal_raw: Sequence[str],
+) -> dict:
+    """Count free addresses in a scope and resolve zero-based ordinals.
+
+    Occupied CIDRs are unioned (overlaps and duplicates collapse) and clipped
+    to the scope before subtraction; entries of a different family reject the
+    whole batch.  Every address of the scope counts, including network and
+    broadcast addresses, and ordinals index the free addresses in increasing
+    numeric address order.  An ordinal equal to or above the free total, a
+    malformed ordinal or CIDR, or a family mismatch raises
+    :class:`ValueError`; an empty ordinal list still yields the total count.
+    """
+    scope = parse_network(scope_raw)
+    occupied = [parse_network(item) for item in occupied_raw]
+    ordinals = [parse_ordinal(item) for item in ordinal_raw]
+
+    free = _free_address_blocks(scope, occupied)
+    total = sum(net.num_addresses for net in free)
+
+    bad = next(
+        (item for value, item in zip(ordinals, ordinal_raw, strict=True)
+         if value >= total),
+        None,
+    )
+    if bad is not None:
+        if total == 0:
+            raise ValueError(
+                f"ordinal {bad} is out of range: the scope has 0 free "
+                f"addresses"
+            )
+        raise ValueError(
+            f"ordinal {bad} is out of range for the free address space "
+            f"(valid range 0..{total - 1}, {total} free addresses)"
+        )
+
+    addresses = _resolve_ordinals(free, ordinals) if ordinals else []
+    return {
+        "free_addresses": str(total),
+        "addresses": [str(address) for address in addresses],
+    }

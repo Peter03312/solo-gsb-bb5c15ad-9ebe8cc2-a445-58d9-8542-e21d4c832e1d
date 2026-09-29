@@ -1,7 +1,7 @@
 """FastAPI application exposing POST /normalize, /evaluate, /compare,
 /audit-rules, /minimize-policy, /allocate, /anonymize,
-/reverse-delegations, /roa-coverage, /as-relationship-repair and
-/nat64-codec."""
+/reverse-delegations, /roa-coverage, /as-relationship-repair,
+/nat64-codec and /free-addresses."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from app.policy import (
     audit_rules,
     compare,
     evaluate,
+    free_addresses,
     minimize_policy,
     nat64_codec,
     normalize,
@@ -33,6 +34,8 @@ from app.schemas import (
     CompareRequest,
     CompareResponse,
     EvaluateRequest,
+    FreeAddressesRequest,
+    FreeAddressesResponse,
     MinimizePolicyRequest,
     MinimizePolicyResponse,
     Nat64CodecRequest,
@@ -67,9 +70,11 @@ app = FastAPI(
         "peer relationships so every supplied origin-to-receiver AS path is "
         "valley-free (up*, at most one peer, down*); and embed/extract IPv4 "
         "addresses in/from mapped IPv6 addresses per the RFC 6052 "
-        "Network-Specific IPv4/IPv6 translation layout."
+        "Network-Specific IPv4/IPv6 translation layout; and locate free "
+        "addresses by zero-based ordinal inside one scope after unioning and "
+        "clipping occupied CIDRs, without enumerating addresses."
     ),
-    version="1.10.0",
+    version="1.11.0",
 )
 
 
@@ -1178,3 +1183,108 @@ def repair_as_relationships(request: AsRelationshipRepairRequest) -> dict:
 )
 def nat64_translate(request: Nat64CodecRequest) -> dict:
     return nat64_codec(request.prefix, request.encode, request.decode)
+
+
+@app.post(
+    "/free-addresses",
+    response_model=FreeAddressesResponse,
+    tags=["policy"],
+    summary="Count free addresses and locate them by zero-based ordinal",
+    openapi_extra={
+        # See /evaluate: named body examples survive only via openapi_extra
+        # for model-typed parameters.
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "overlap_union_and_out_of_scope_clip": {
+                            "summary": (
+                                "Occupied CIDRs overlap each other and spill "
+                                "past the scope; they are unioned and clipped "
+                                "first, then ordinals are mapped in numeric "
+                                "order"
+                            ),
+                            "value": {
+                                "scope": "10.0.0.0/30",
+                                "occupied": [
+                                    "10.0.0.0/31",
+                                    "10.0.0.1/32",
+                                    "9.255.255.252/30",
+                                ],
+                                "indices": ["0", "1", "0"],
+                            },
+                        },
+                        "empty_indices_returns_total": {
+                            "summary": "No indices: only the free total is returned",
+                            "value": {
+                                "scope": "2001:db8::/120",
+                                "occupied": ["2001:db8::/126"],
+                                "indices": [],
+                            },
+                        },
+                        "ipv6_slash_zero": {
+                            "summary": "The whole IPv6 space minus one /0 leaves nothing",
+                            "value": {
+                                "scope": "::/0",
+                                "occupied": ["::/0"],
+                                "indices": [],
+                            },
+                        },
+                        "ordinal_out_of_range": {
+                            "summary": "Ordinal equal to the free total -> HTTP 422",
+                            "value": {
+                                "scope": "10.0.0.0/31",
+                                "occupied": [],
+                                "indices": ["2"],
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+    responses={
+        200: {
+            "description": (
+                "The free address total plus one address per input ordinal, "
+                "in input order."
+            ),
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "overlap_union_and_out_of_scope_clip": {
+                            "summary": (
+                                "Two addresses survive; ordinals keep input "
+                                "order and may repeat"
+                            ),
+                            "value": {
+                                "free_addresses": "2",
+                                "addresses": [
+                                    "10.0.0.2", "10.0.0.3", "10.0.0.2",
+                                ],
+                            },
+                        },
+                        "empty_indices_returns_total": {
+                            "summary": "256 - 4 = 252 free IPv6 addresses",
+                            "value": {
+                                "free_addresses": "252",
+                                "addresses": [],
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        422: {
+            "description": (
+                "Invalid scope/occupied CIDR, an occupied entry of another "
+                "address family, a malformed ordinal, or an ordinal equal to "
+                "or above the free total; the whole batch is rejected."
+            ),
+        },
+    },
+)
+def locate_free_addresses(request: FreeAddressesRequest) -> dict:
+    # Schema validation already computes the same result and rejects invalid
+    # batches with 422; this recomputation only serializes the response model.
+    return free_addresses(request.scope, request.occupied, request.indices)

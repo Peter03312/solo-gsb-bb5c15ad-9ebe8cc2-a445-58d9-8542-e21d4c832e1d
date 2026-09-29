@@ -20,10 +20,12 @@ from app.policy import (
     _parse_reverse_cidr,
     _validate_reverse_batch,
     as_relationship_token,
+    free_addresses,
     parse_address,
     parse_key_hex,
     parse_nat64_prefix,
     parse_network,
+    parse_ordinal,
     parse_strict_cidr,
 )
 
@@ -1038,5 +1040,79 @@ class Nat64CodecResponse(BaseModel):
     decoded: list[str] = Field(
         description=(
             "Embedded IPv4 addresses, one per input decode address, in input order."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /free-addresses
+# ---------------------------------------------------------------------------
+
+
+class FreeAddressesRequest(BaseModel):
+    scope: str = Field(
+        description=(
+            "Single strict CIDR (IPv4 or IPv6) bounding the lookup. Host bits "
+            "must be zero."
+        ),
+    )
+    occupied: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Occupied CIDRs, unioned (overlaps and duplicates collapse) and "
+            "clipped to the scope before subtraction; entries may extend "
+            "beyond the scope, but each must share the scope address family."
+        ),
+    )
+    indices: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Zero-based decimal ordinals into the free addresses in increasing "
+            "numeric order, in response order. Strings (not JSON numbers) so "
+            "IPv6 ordinals beyond 2**53 stay exact; no signs or leading zeros."
+        ),
+    )
+
+    @field_validator("scope")
+    @classmethod
+    def _validate_scope(cls, value: str) -> str:
+        parse_network(value)
+        return value
+
+    @field_validator("occupied")
+    @classmethod
+    def _validate_occupied_list(cls, values: list[str]) -> list[str]:
+        for value in values:
+            parse_network(value)
+        return values
+
+    @field_validator("indices")
+    @classmethod
+    def _validate_ordinal_list(cls, values: list[str]) -> list[str]:
+        for value in values:
+            parse_ordinal(value)
+        return values
+
+    @model_validator(mode="after")
+    def _validate_family_and_range(self) -> "FreeAddressesRequest":
+        # Family consistency and ordinal range both require the computed free
+        # space; resolving once here rejects the whole batch with HTTP 422,
+        # exactly like the per-field validators above.
+        free_addresses(self.scope, self.occupied, self.indices)
+        return self
+
+
+class FreeAddressesResponse(BaseModel):
+    free_addresses: str = Field(
+        description=(
+            "Total free addresses in the scope after the occupied union is "
+            "subtracted, as a decimal string (IPv6 totals exceed JSON's safe "
+            "integer range)."
+        ),
+    )
+    addresses: list[str] = Field(
+        description=(
+            "Free address for each input ordinal, one-to-one in input order; "
+            "empty when indices is empty."
         ),
     )

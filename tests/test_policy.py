@@ -20,6 +20,7 @@ from app.policy import (
     audit_rules,
     compare,
     evaluate,
+    free_addresses,
     minimize_policy,
     nat64_codec,
     normalize,
@@ -27,6 +28,7 @@ from app.policy import (
     parse_key_hex,
     parse_nat64_prefix,
     parse_network,
+    parse_ordinal,
     parse_strict_cidr,
     reverse_delegations,
     roa_coverage,
@@ -2740,3 +2742,230 @@ def test_nat64_wrong_family_addresses_rejected():
         nat64_codec("2001:db8::/96", ["10.0.0.1/32"], [])
     with pytest.raises(ValueError):
         nat64_codec("2001:db8::/96", [], ["2001:db8::1/128"])
+
+
+# ---------------------------------------------------------------------------
+# free-addresses
+# ---------------------------------------------------------------------------
+
+
+def ref_free(scope, occupied):
+    """Brute-force reference: enumerate the (small) scope as ints."""
+    network = ipaddress.ip_network(scope, strict=True)
+    used = set()
+    for value in occupied:
+        other = ipaddress.ip_network(value, strict=True)
+        if other.version != network.version or not other.overlaps(network):
+            continue
+        lo = max(int(network.network_address), int(other.network_address))
+        hi = min(int(network.broadcast_address), int(other.broadcast_address))
+        used.update(range(lo, hi + 1))
+    lo = int(network.network_address)
+    hi = int(network.broadcast_address)
+    free = [lo + i for i in range(hi - lo + 1) if lo + i not in used]
+    return free
+
+
+def test_free_addresses_basic_overlap_union_and_clip():
+    # /30 = .0..3; .0/31 and .1/32 union to .0..1; the /30 at 9.x is clipped
+    # away entirely.  Free addresses are .2 and .3; ordinals keep order and
+    # may repeat.
+    result = free_addresses(
+        "10.0.0.0/30",
+        ["10.0.0.0/31", "10.0.0.1/32", "9.255.255.252/30"],
+        ["0", "1", "0"],
+    )
+    assert result == {
+        "free_addresses": "2",
+        "addresses": ["10.0.0.2", "10.0.0.3", "10.0.0.2"],
+    }
+
+
+def test_free_addresses_total_is_decimal_string():
+    result = free_addresses("10.0.0.0/24", [], [])
+    assert result["free_addresses"] == "256"
+    assert isinstance(result["free_addresses"], str)
+    assert result["addresses"] == []
+
+
+def test_free_addresses_all_address_bits_count_including_network_broadcast():
+    result = free_addresses("192.0.2.0/30", [], [str(i) for i in range(4)])
+    assert result["free_addresses"] == "4"
+    assert result["addresses"] == [
+        "192.0.2.0", "192.0.2.1", "192.0.2.2", "192.0.2.3",
+    ]
+
+
+def test_free_addresses_wider_occupied_is_clipped():
+    result = free_addresses("10.0.0.0/24", ["10.0.0.0/16", "10.0.0.0/8"], [])
+    assert result == {"free_addresses": "0", "addresses": []}
+
+
+def test_free_addresses_disjoint_occupied_is_ignored():
+    result = free_addresses(
+        "10.0.0.0/24",
+        ["10.0.1.0/24", "9.255.255.0/24", "10.1.0.0/16"],
+        ["0", "255"],
+    )
+    assert result["free_addresses"] == "256"
+    assert result["addresses"] == ["10.0.0.0", "10.0.0.255"]
+
+
+def test_free_addresses_empty_query_still_returns_total():
+    assert free_addresses("10.0.0.0/32", ["10.0.0.0/32"], []) == {
+        "free_addresses": "0",
+        "addresses": [],
+    }
+    assert free_addresses("::/0", ["::/0"], []) == {
+        "free_addresses": "0",
+        "addresses": [],
+    }
+
+
+def test_free_addresses_ipv4_slash_zero():
+    result = free_addresses("0.0.0.0/0", [], ["0", str(2**32 - 1)])
+    assert result["free_addresses"] == str(2**32)
+    assert result["addresses"] == ["0.0.0.0", "255.255.255.255"]
+
+
+def test_free_addresses_ipv6_slash_zero_without_enumeration():
+    result = free_addresses("::/0", [], [])
+    assert result["free_addresses"] == str(2**128)
+    assert result["addresses"] == []
+
+    occupied = free_addresses("::/0", ["2001:db8::/32"], ["0", str(2**32)])
+    assert occupied["free_addresses"] == str(2**128 - 2**96)
+    # Both ordinals sit in the first free block below the 2001:db8::/32 hole.
+    assert occupied["addresses"] == ["::", str(ipaddress.IPv6Address(2**32))]
+
+    # The first free block holds exactly hole_start addresses, so ordinal
+    # hole_start is the first address after the hole.
+    hole_start = int(ipaddress.IPv6Address("2001:db8::"))
+    after = free_addresses("::/0", ["2001:db8::/32"], [str(hole_start)])
+    assert after["addresses"] == ["2001:db9::"]
+    # Last address of the whole space is ordinal 2**128 - 2**96 - 1.
+    last = free_addresses(
+        "::/0", ["2001:db8::/32"], [str(2**128 - 2**96 - 1)]
+    )
+    assert last["addresses"] == ["ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"]
+
+
+def test_free_addresses_last_valid_ordinal():
+    result = free_addresses(
+        "10.0.0.0/24", ["10.0.0.0/25"], [str(2**7 - 1), "0"]
+    )
+    assert result["free_addresses"] == "128"
+    assert result["addresses"] == ["10.0.0.255", "10.0.0.128"]
+
+
+@pytest.mark.parametrize("bad", ["-1", "", "   ", "01", "1.0", "+1", "abc", "1 0"])
+def test_parse_ordinal_rejects_non_canonical_decimal(bad):
+    with pytest.raises(ValueError):
+        parse_ordinal(bad)
+
+
+def test_parse_ordinal_strips_surrounding_whitespace():
+    assert parse_ordinal("  42 ") == 42
+    with pytest.raises(ValueError):
+        parse_ordinal(" 01 ")  # internal form still must be canonical
+
+
+@pytest.mark.parametrize("text", ["0", "1", "10", str(2**128)])
+def test_parse_ordinal_accepts_canonical_decimal(text):
+    assert parse_ordinal(text) == int(text)
+
+
+def test_parse_ordinal_requires_string():
+    with pytest.raises(ValueError, match="decimal string"):
+        parse_ordinal(7)
+
+
+def test_free_addresses_ordinal_equal_to_total_rejected():
+    with pytest.raises(ValueError, match="out of range"):
+        free_addresses("10.0.0.0/31", [], ["2"])
+    with pytest.raises(ValueError, match="0 free"):
+        free_addresses("10.0.0.0/32", ["10.0.0.0/32"], ["0"])
+
+
+def test_free_addresses_invalid_scope_rejected():
+    with pytest.raises(ValueError):
+        free_addresses("10.0.0.1/24", [], [])
+    with pytest.raises(ValueError):
+        free_addresses("garbage", [], [])
+
+
+def test_free_addresses_invalid_occupied_rejected():
+    with pytest.raises(ValueError):
+        free_addresses("10.0.0.0/24", ["10.0.0.1/24"], [])
+    with pytest.raises(ValueError):
+        free_addresses("10.0.0.0/24", ["nope/8"], [])
+
+
+def test_free_addresses_family_mismatch_rejected():
+    with pytest.raises(ValueError, match="address family"):
+        free_addresses("10.0.0.0/24", ["2001:db8::/32"], [])
+    with pytest.raises(ValueError, match="address family"):
+        free_addresses("::/0", ["0.0.0.0/0"], ["0"])
+    # A cross-family entry disjoint from an IPv6 scope still rejects the batch.
+    with pytest.raises(ValueError, match="address family"):
+        free_addresses("2001:db8::/64", ["10.0.0.0/32"], [])
+
+
+def test_free_addresses_duplicate_indices_resolve_identically():
+    result = free_addresses("10.0.0.0/29", [], ["3", "3", "3"])
+    assert result["addresses"] == ["10.0.0.3", "10.0.0.3", "10.0.0.3"]
+
+
+def test_free_addresses_random_bruteforce_against_enumerated_scope():
+    rng = random.Random(20260929)
+    for _ in range(60):
+        length = rng.randint(24, 30)
+        base = rng.getrandbits(32) & ~((1 << (32 - length)) - 1)
+        scope = ipaddress.IPv4Network((base, length))
+        occupied = []
+        for _ in range(rng.randint(0, 5)):
+            pl = rng.randint(length, 32)
+            cut = rng.choice([
+                lambda: base,
+                lambda: rng.getrandbits(32) & ~((1 << max(0, 32 - pl)) - 1),
+            ])()
+            occupied.append(str(ipaddress.IPv4Network((cut, pl), strict=False)))
+        # Some occupied entries intentionally spill outside the scope (same
+        # family); these are clipped rather than rejected.
+        if rng.random() < 0.3:
+            cut = rng.getrandbits(32) & ~((1 << 24) - 1)
+            occupied.append(str(ipaddress.IPv4Network((cut, 24), strict=False)))
+        result = free_addresses(str(scope), occupied, [])
+        expected = ref_free(str(scope), occupied)
+        assert result["free_addresses"] == str(len(expected))
+        if expected:
+            picks = sorted({rng.randrange(len(expected))
+                            for _ in range(rng.randint(1, 4))})
+            looked = free_addresses(
+                str(scope), occupied, [str(p) for p in picks]
+            )
+            assert looked["addresses"] == [
+                str(ipaddress.IPv4Address(value)) for value in
+                (expected[p] for p in picks)
+            ]
+
+
+def test_free_addresses_ipv6_bruteforce_small_scopes():
+    rng = random.Random(987654321)
+    for _ in range(40):
+        length = rng.randint(120, 126)
+        base = rng.getrandbits(128) & ~((1 << (128 - length)) - 1)
+        scope = ipaddress.IPv6Network((base, length))
+        occupied = []
+        for _ in range(rng.randint(0, 4)):
+            pl = rng.randint(length, 128)
+            cut = rng.getrandbits(128) & ~((1 << max(0, 128 - pl)) - 1)
+            occupied.append(str(ipaddress.IPv6Network((cut, pl), strict=False)))
+        expected = ref_free(str(scope), occupied)
+        result = free_addresses(str(scope), occupied, [])
+        assert result["free_addresses"] == str(len(expected))
+        if expected:
+            pick = rng.randrange(len(expected))
+            assert free_addresses(
+                str(scope), occupied, [str(pick)]
+            )["addresses"] == [str(ipaddress.IPv6Address(expected[pick]))]
